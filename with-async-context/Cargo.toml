@@ -1,6 +1,6 @@
 [package]
 name = "with-async-context"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "A Rust library for managing contextual data across async tasks"
 license = "MIT"
