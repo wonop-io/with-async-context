@@ -52,7 +52,7 @@ use std::{any::Any, cell::RefCell, pin::Pin, rc::Rc, sync::Mutex, task::Poll};
 use pin_project::pin_project;
 
 thread_local! {
-    static CONTEXT: RefCell<Option<Rc<dyn Any>>> = RefCell::new(None);
+    static CONTEXT: RefCell<Option<Rc<RefCell<dyn Any>>>> = RefCell::new(None);
     static HAS_CONTEXT: RefCell<bool> = RefCell::new(false);
 }
 
@@ -65,7 +65,7 @@ where
     F: Future<Output = T>,
 {
     /// The context data wrapped in a mutex for thread-safety
-    ctx: Mutex<Option<Rc<C>>>,
+    ctx: Mutex<Option<Rc<RefCell<C>>>>,
 
     /// The future being executed, marked with #[pin] for self-referential struct support
     #[pin]
@@ -122,7 +122,7 @@ where
     }
 
     AsyncContext {
-        ctx: Mutex::new(Some(Rc::new(ctx))),
+        ctx: Mutex::new(Some(Rc::new(RefCell::new(ctx)))),
         future,
     }
 }
@@ -133,14 +133,14 @@ where
     F: Future<Output = T>,
 {
     // Returns a tuple of the Future's output value and the context
-    type Output = (T, Rc<C>);
+    type Output = (T, Rc<RefCell<C>>);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
         // Take ownership of the context from the mutex, removing it temporarily
-        let ctx: Rc<C> = self
+        let ctx: Rc<RefCell<C>> = self
             .ctx
             .lock()
             .expect("Failed to lock context mutex")
@@ -222,7 +222,10 @@ where
     CONTEXT.with(|value| match value.borrow().as_ref() {
         None => f(None),
         Some(ctx) => {
-            let ctx_ref = ctx.downcast_ref::<C>().expect("Context type mismatch");
+            let ctx_inner = ctx.borrow();
+            let ctx_ref = ctx_inner
+                .downcast_ref::<C>()
+                .expect("Context type mismatch");
             f(Some(ctx_ref))
         }
     })
@@ -264,9 +267,11 @@ where
     CONTEXT.with(|value| {
         let mut binding = value.borrow_mut();
         let ctx = binding.as_mut().expect("No context found");
-        let ctx_ref = ctx.downcast_mut::<C>().expect("Context type mismatch");
-        let ctx_mut = unsafe { &mut *(ctx_ref as *const C as *mut C) };
-        f(Some(ctx_mut))
+        let mut ctx_inner = ctx.borrow_mut();
+        let ctx_ref = ctx_inner
+            .downcast_mut::<C>()
+            .expect("Context type mismatch");
+        f(Some(ctx_ref))
     })
 }
 
