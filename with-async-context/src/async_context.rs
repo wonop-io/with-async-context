@@ -65,7 +65,7 @@ where
     F: Future<Output = T>,
 {
     /// The context data wrapped in a mutex for thread-safety
-    ctx: Mutex<Option<Rc<RefCell<C>>>>,
+    ctx: Mutex<Rc<RefCell<Option<C>>>>,
 
     /// The future being executed, marked with #[pin] for self-referential struct support
     #[pin]
@@ -122,7 +122,7 @@ where
     }
 
     AsyncContext {
-        ctx: Mutex::new(Some(Rc::new(RefCell::new(ctx)))),
+        ctx: Mutex::new(Rc::new(RefCell::new(Some(ctx)))),
         future,
     }
 }
@@ -133,50 +133,52 @@ where
     F: Future<Output = T>,
 {
     // Returns a tuple of the Future's output value and the context
-    type Output = (T, Rc<RefCell<C>>);
+    type Output = (T, C);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        // Take ownership of the context from the mutex, removing it temporarily
-        let ctx: Rc<RefCell<C>> = self
-            .ctx
-            .lock()
-            .expect("Failed to lock context mutex")
-            .take()
-            .expect("No context found");
+        let (value, ctx) = {
+            // Take ownership of the context from the mutex, removing it temporarily
+            let ctx: Option<C> = self
+                .ctx
+                .lock()
+                .expect("Failed to lock context mutex")
+                .take();
+            let ctx = Rc::new(RefCell::new(ctx));
 
-        // Set thread-local flags to indicate context is now active
-        HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
+            // Set thread-local flags to indicate context is now active
+            HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
 
-        // Store context in thread local storage
-        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
+            // Store context in thread local storage
+            CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
 
-        // Project the pinned future to get mutable access
-        let projection = self.project();
-        let future: Pin<&mut F> = projection.future;
+            // Project the pinned future to get mutable access
+            let projection = self.project();
+            let future: Pin<&mut F> = projection.future;
 
-        // Poll the inner future
-        let poll = future.poll(cx);
+            // Poll the inner future
+            let poll = future.poll(cx);
 
-        // Reset thread-local flag since we're done with this poll
-        HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
-        CONTEXT.with(|x| *x.borrow_mut() = None);
-
-        match poll {
-            // If future is complete, return result with context
-            Poll::Ready(value) => return Poll::Ready((value, ctx)),
-            // If pending, restore context to mutex and return pending
-            Poll::Pending => {
-                projection
-                    .ctx
-                    .lock()
-                    .expect("Failed to lock context mutex")
-                    .replace(ctx);
-                Poll::Pending
+            // Reset thread-local flag since we're done with this poll
+            HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
+            CONTEXT.with(|x| *x.borrow_mut() = None);
+            match poll {
+                // If future is complete, return result with context
+                Poll::Ready(value) => (value, ctx),
+                // If pending, restore context to mutex and return pending
+                Poll::Pending => {
+                    projection
+                        .ctx
+                        .lock()
+                        .expect("Failed to lock context mutex")
+                        .replace(ctx.take());
+                    return Poll::Pending;
+                }
             }
-        }
+        };
+        return Poll::Ready((value, ctx.take().expect("Context not found")));
     }
 }
 
@@ -224,9 +226,12 @@ where
         Some(ctx) => {
             let ctx_inner = ctx.borrow();
             let ctx_ref = ctx_inner
-                .downcast_ref::<C>()
+                .downcast_ref::<Option<C>>()
                 .expect("Context type mismatch");
-            f(Some(ctx_ref))
+            match ctx_ref {
+                Some(c) => f(Some(c)),
+                None => f(None),
+            }
         }
     })
 }
@@ -266,12 +271,19 @@ where
 {
     CONTEXT.with(|value| {
         let mut binding = value.borrow_mut();
-        let ctx = binding.as_mut().expect("No context found");
-        let mut ctx_inner = ctx.borrow_mut();
-        let ctx_ref = ctx_inner
-            .downcast_mut::<C>()
-            .expect("Context type mismatch");
-        f(Some(ctx_ref))
+        match binding.as_mut() {
+            None => f(None),
+            Some(ctx) => {
+                let mut ctx_inner = ctx.borrow_mut();
+                let ctx_ref = ctx_inner
+                    .downcast_mut::<Option<C>>()
+                    .expect("Context type mismatch");
+                match ctx_ref {
+                    Some(c) => f(Some(c)),
+                    None => f(None),
+                }
+            }
+        }
     })
 }
 
@@ -351,7 +363,7 @@ mod tests {
         let (value, ctx) = async_context.await;
 
         assert_eq!(test_struct, value);
-        assert_eq!(test_struct, *ctx);
+        assert_eq!(test_struct, ctx);
     }
 
     #[tokio::test]
@@ -542,7 +554,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "downcast failed")]
+    #[should_panic(expected = "Context type mismatch")]
     async fn test_wrong_context_type() {
         #[derive(Debug)]
         struct Context1 {
@@ -556,9 +568,7 @@ mod tests {
         }
 
         #[derive(Debug)]
-        struct Context2 {
-            text: String,
-        }
+        struct Context2;
 
         async fn access_wrong_type() {
             // Try to access Context2 when Context1 is active
