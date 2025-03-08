@@ -47,13 +47,12 @@
 //! # }
 //! ```
 use core::future::Future;
-use std::{cell::RefCell, pin::Pin, sync::Mutex, task::Poll};
+use std::{any::Any, cell::RefCell, pin::Pin, rc::Rc, sync::Mutex, task::Poll};
 
 use pin_project::pin_project;
 
-// Using Option<C> directly instead of Box<dyn Any>
 thread_local! {
-    static CONTEXT: RefCell<Option<*mut ()>> = RefCell::new(None);
+    static CONTEXT: RefCell<Option<Rc<dyn Any>>> = RefCell::new(None);
     static HAS_CONTEXT: RefCell<bool> = RefCell::new(false);
 }
 
@@ -66,7 +65,7 @@ where
     F: Future<Output = T>,
 {
     /// The context data wrapped in a mutex for thread-safety
-    ctx: Mutex<Option<C>>,
+    ctx: Mutex<Option<Rc<C>>>,
 
     /// The future being executed, marked with #[pin] for self-referential struct support
     #[pin]
@@ -123,7 +122,7 @@ where
     }
 
     AsyncContext {
-        ctx: Mutex::new(Some(ctx)),
+        ctx: Mutex::new(Some(Rc::new(ctx))),
         future,
     }
 }
@@ -134,14 +133,14 @@ where
     F: Future<Output = T>,
 {
     // Returns a tuple of the Future's output value and the context
-    type Output = (T, C);
+    type Output = (T, Rc<C>);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
         // Take ownership of the context from the mutex, removing it temporarily
-        let ctx: C = self
+        let ctx: Rc<C> = self
             .ctx
             .lock()
             .expect("Failed to lock context mutex")
@@ -151,9 +150,8 @@ where
         // Set thread-local flags to indicate context is now active
         HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
 
-        // Store a raw pointer to the context in thread local storage
-        let ctx_ptr = &ctx as *const C as *mut ();
-        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx_ptr));
+        // Store context in thread local storage
+        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
 
         // Project the pinned future to get mutable access
         let projection = self.project();
@@ -221,10 +219,12 @@ where
     F: FnOnce(Option<&C>) -> R,
     C: 'static,
 {
-    CONTEXT.with(|value| {
-        let ptr = value.borrow().expect("No context found");
-        let ctx = unsafe { &*(ptr as *const C) };
-        f(Some(ctx))
+    CONTEXT.with(|value| match value.borrow().as_ref() {
+        None => f(None),
+        Some(ctx) => {
+            let ctx_ref = ctx.downcast_ref::<C>().expect("Context type mismatch");
+            f(Some(ctx_ref))
+        }
     })
 }
 
@@ -262,15 +262,17 @@ where
     C: 'static,
 {
     CONTEXT.with(|value| {
-        let ptr = value.borrow().unwrap();
-        let ctx = unsafe { &mut *(ptr as *mut C) };
-        f(Some(ctx))
+        let mut binding = value.borrow_mut();
+        let ctx = binding.as_mut().expect("No context found");
+        let ctx_ref = ctx.downcast_mut::<C>().expect("Context type mismatch");
+        let ctx_mut = unsafe { &mut *(ctx_ref as *const C as *mut C) };
+        f(Some(ctx_mut))
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt::Display, sync::Arc, time::Duration};
+    use std::{cell::RefCell, fmt::Display, sync::Arc, time::Duration};
 
     use tokio::time::sleep;
 
@@ -287,29 +289,30 @@ mod tests {
         let (value, ctx) = async_context.await;
 
         assert_eq!("foobar", value);
-        assert_eq!("foobar", ctx);
+        assert_eq!("foobar", &*ctx);
     }
 
     #[tokio::test]
     async fn test_mutable_context() {
         #[derive(Debug)]
-        struct IntWrapper(i32);
+        struct IntWrapper(RefCell<i32>);
 
         impl Display for IntWrapper {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.0)
+                write!(f, "{}", self.0.borrow())
             }
         }
 
         async fn mutate_context() -> i32 {
-            from_context_mut(|value: Option<&mut IntWrapper>| {
+            from_context(|value: Option<&IntWrapper>| {
                 let val = value.unwrap();
-                val.0 += 5;
-                val.0
+                *val.0.borrow_mut() += 5;
+                *val.0.borrow()
             })
         }
 
-        let async_context = execute_with_async_context(IntWrapper(10), mutate_context());
+        let async_context =
+            execute_with_async_context(IntWrapper(RefCell::new(10)), mutate_context());
         let (value, ctx) = async_context.await;
 
         assert_eq!(15, value);
@@ -343,7 +346,7 @@ mod tests {
         let (value, ctx) = async_context.await;
 
         assert_eq!(test_struct, value);
-        assert_eq!(test_struct, ctx);
+        assert_eq!(test_struct, *ctx);
     }
 
     #[tokio::test]
@@ -416,23 +419,23 @@ mod tests {
     #[tokio::test]
     async fn test_parallel_contexts() {
         #[derive(Debug)]
-        struct IntWrapper(i32);
+        struct IntWrapper(Arc<i32>);
 
         impl Display for IntWrapper {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "{}", self.0)
+                write!(f, "{}", *self.0)
             }
         }
 
         async fn task(id: i32) -> i32 {
-            let val = from_context(|ctx: Option<&IntWrapper>| ctx.unwrap().0);
+            let val = from_context(|ctx: Option<&IntWrapper>| *ctx.unwrap().0);
             sleep(Duration::from_millis(50)).await;
             val + id
         }
 
-        let task1 = execute_with_async_context(IntWrapper(1), task(10));
-        let task2 = execute_with_async_context(IntWrapper(2), task(20));
-        let task3 = execute_with_async_context(IntWrapper(3), task(30));
+        let task1 = execute_with_async_context(IntWrapper(Arc::new(1)), task(10));
+        let task2 = execute_with_async_context(IntWrapper(Arc::new(2)), task(20));
+        let task3 = execute_with_async_context(IntWrapper(Arc::new(3)), task(30));
 
         let ((r1, _), (r2, _), (r3, _)) = tokio::join!(task1, task2, task3);
 
@@ -476,12 +479,12 @@ mod tests {
     async fn test_value_chains() {
         #[derive(Debug)]
         struct NumberContext {
-            value: i32,
+            value: Arc<i32>,
         }
 
         impl Display for NumberContext {
             fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                write!(f, "Number: {}", self.value)
+                write!(f, "Number: {}", *self.value)
             }
         }
 
@@ -491,7 +494,7 @@ mod tests {
         ) -> Pin<Box<dyn Future<Output = i32> + Send>> {
             Box::pin(async move {
                 let ret = from_context(|ctx: Option<&NumberContext>| {
-                    let value = ctx.unwrap().value;
+                    let value = *ctx.unwrap().value;
                     assert_eq!(value, expected_value, "Context value changed");
                     value
                 });
@@ -505,20 +508,62 @@ mod tests {
         }
 
         async fn run_value_chain(n: i32) -> i32 {
-            let ctx = NumberContext { value: n };
-            let (result, _) = execute_with_async_context(ctx, check_value(10, n)).await;
+            let ctx = NumberContext { value: Arc::new(n) };
+            // Run in local task to avoid Send requirement
+            let result = tokio::task::LocalSet::new()
+                .run_until(async move {
+                    let (result, _) = execute_with_async_context(ctx, check_value(10, n)).await;
+                    result
+                })
+                .await;
             result
         }
 
-        let mut chain_tasks = Vec::new();
-        for i in 0..500 {
-            chain_tasks.push(tokio::spawn(run_value_chain(i)));
+        let local = tokio::task::LocalSet::new();
+        local.spawn_local(async {
+            let mut chain_tasks = Vec::new();
+            for i in 0..500 {
+                let handle = tokio::task::spawn_local(run_value_chain(i));
+                chain_tasks.push(handle);
+            }
+
+            let results = futures::future::join_all(chain_tasks).await;
+
+            for (i, result) in results.into_iter().enumerate() {
+                assert_eq!(result.unwrap(), i as i32);
+            }
+        });
+        local.await;
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "downcast failed")]
+    async fn test_wrong_context_type() {
+        #[derive(Debug)]
+        struct Context1 {
+            value: i32,
         }
 
-        let results = futures::future::join_all(chain_tasks).await;
-
-        for (i, result) in results.into_iter().enumerate() {
-            assert_eq!(result.unwrap(), i as i32);
+        impl Display for Context1 {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}", self.value)
+            }
         }
+
+        #[derive(Debug)]
+        struct Context2 {
+            text: String,
+        }
+
+        async fn access_wrong_type() {
+            // Try to access Context2 when Context1 is active
+            from_context(|ctx: Option<&Context2>| {
+                let _ = ctx.unwrap();
+            });
+        }
+
+        let ctx = Context1 { value: 42 };
+        let context = execute_with_async_context(ctx, access_wrong_type());
+        let _ = context.await;
     }
 }
