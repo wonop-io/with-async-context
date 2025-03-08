@@ -29,5 +29,5 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Testing rush
-        working-directory: rush
+        working-directory: with-async-context
         run: cargo test
