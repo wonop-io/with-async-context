@@ -47,12 +47,13 @@
 //! # }
 //! ```
 use core::future::Future;
-use std::{any::Any, cell::RefCell, pin::Pin, sync::Mutex, task::Poll};
+use std::{cell::RefCell, pin::Pin, sync::Mutex, task::Poll};
 
 use pin_project::pin_project;
 
+// Using Option<C> directly instead of Box<dyn Any>
 thread_local! {
-    static CONTEXT: RefCell<Box<dyn Any>> = RefCell::new(Box::new(()));
+    static CONTEXT: RefCell<Option<*mut ()>> = RefCell::new(None);
     static HAS_CONTEXT: RefCell<bool> = RefCell::new(false);
 }
 
@@ -132,12 +133,14 @@ where
     C: 'static + ToString,
     F: Future<Output = T>,
 {
+    // Returns a tuple of the Future's output value and the context
     type Output = (T, C);
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
+        // Take ownership of the context from the mutex, removing it temporarily
         let ctx: C = self
             .ctx
             .lock()
@@ -145,18 +148,28 @@ where
             .take()
             .expect("No context found");
 
+        // Set thread-local flags to indicate context is now active
         HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
-        CONTEXT.set(Box::new(ctx));
 
+        // Store a raw pointer to the context in thread local storage
+        let ctx_ptr = &ctx as *const C as *mut ();
+        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx_ptr));
+
+        // Project the pinned future to get mutable access
         let projection = self.project();
         let future: Pin<&mut F> = projection.future;
+
+        // Poll the inner future
         let poll = future.poll(cx);
 
-        let ctx: C = Box::into_inner(CONTEXT.replace(Box::new(())).downcast().unwrap());
+        // Reset thread-local flag since we're done with this poll
         HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
+        CONTEXT.with(|x| *x.borrow_mut() = None);
 
         match poll {
+            // If future is complete, return result with context
             Poll::Ready(value) => return Poll::Ready((value, ctx)),
+            // If pending, restore context to mutex and return pending
             Poll::Pending => {
                 projection
                     .ctx
@@ -208,7 +221,11 @@ where
     F: FnOnce(Option<&C>) -> R,
     C: 'static,
 {
-    return CONTEXT.with(|value| f(value.borrow().downcast_ref::<C>()));
+    CONTEXT.with(|value| {
+        let ptr = value.borrow().expect("No context found");
+        let ctx = unsafe { &*(ptr as *const C) };
+        f(Some(ctx))
+    })
 }
 
 /// Provides mutable access to the current context value
@@ -244,7 +261,11 @@ where
     F: FnOnce(Option<&mut C>) -> R,
     C: 'static,
 {
-    return CONTEXT.with(|value| f(value.borrow_mut().downcast_mut::<C>()));
+    CONTEXT.with(|value| {
+        let ptr = value.borrow().unwrap();
+        let ctx = unsafe { &mut *(ptr as *mut C) };
+        f(Some(ctx))
+    })
 }
 
 #[cfg(test)]
