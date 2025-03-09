@@ -65,7 +65,7 @@ where
     F: Future<Output = T>,
 {
     /// The context data wrapped in a mutex for thread-safety
-    ctx: Mutex<Rc<RefCell<Option<C>>>>,
+    ctx: Mutex<Option<C>>,
 
     /// The future being executed, marked with #[pin] for self-referential struct support
     #[pin]
@@ -122,7 +122,7 @@ where
     }
 
     AsyncContext {
-        ctx: Mutex::new(Rc::new(RefCell::new(Some(ctx)))),
+        ctx: Mutex::new(Some(ctx)),
         future,
     }
 }
@@ -139,46 +139,45 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        let (value, ctx) = {
-            // Take ownership of the context from the mutex, removing it temporarily
-            let ctx: Option<C> = self
-                .ctx
-                .lock()
-                .expect("Failed to lock context mutex")
-                .take();
-            let ctx = Rc::new(RefCell::new(ctx));
+        // Take ownership of the context from the mutex, removing it temporarily
+        let ctx: Option<C> = self
+            .ctx
+            .lock()
+            .expect("Failed to lock context mutex")
+            .take();
+        let ctx = Rc::new(RefCell::new(ctx));
 
-            // Set thread-local flags to indicate context is now active
-            HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
+        // Set thread-local flags to indicate context is now active
+        HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
 
-            // Store context in thread local storage
-            CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
+        // Store context in thread local storage
+        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
 
-            // Project the pinned future to get mutable access
-            let projection = self.project();
-            let future: Pin<&mut F> = projection.future;
+        // Project the pinned future to get mutable access
+        let projection = self.project();
+        let future: Pin<&mut F> = projection.future;
 
-            // Poll the inner future
-            let poll = future.poll(cx);
+        // Poll the inner future
+        let poll = future.poll(cx);
 
-            // Reset thread-local flag since we're done with this poll
-            HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
-            CONTEXT.with(|x| *x.borrow_mut() = None);
-            match poll {
-                // If future is complete, return result with context
-                Poll::Ready(value) => (value, ctx),
-                // If pending, restore context to mutex and return pending
-                Poll::Pending => {
-                    projection
-                        .ctx
-                        .lock()
-                        .expect("Failed to lock context mutex")
-                        .replace(ctx.take());
-                    return Poll::Pending;
-                }
+        // Reset thread-local flag since we're done with this poll
+        HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
+        CONTEXT.with(|x| *x.borrow_mut() = None);
+
+        let ctx = ctx.take().expect("Context not found");
+        match poll {
+            // If future is complete, return result with context
+            Poll::Ready(value) => return Poll::Ready((value, ctx)),
+            // If pending, restore context to mutex and return pending
+            Poll::Pending => {
+                projection
+                    .ctx
+                    .lock()
+                    .expect("Failed to lock context mutex")
+                    .replace(ctx);
+                return Poll::Pending;
             }
-        };
-        return Poll::Ready((value, ctx.take().expect("Context not found")));
+        }
     }
 }
 
