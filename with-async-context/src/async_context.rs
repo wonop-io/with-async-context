@@ -160,11 +160,14 @@ where
         // Poll the inner future
         let poll = future.poll(cx);
 
+        let ctx = ctx.take().expect(
+            "No context is attached to the AyncContext - this is not supposed to be possible.",
+        );
+
         // Reset thread-local flag since we're done with this poll
         HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
         CONTEXT.with(|x| *x.borrow_mut() = None);
 
-        let ctx = ctx.take().expect("Context not found");
         match poll {
             // If future is complete, return result with context
             Poll::Ready(value) => return Poll::Ready((value, ctx)),
@@ -389,10 +392,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[should_panic(expected = "No context found")]
+    #[should_panic(expected = "No context found while using from_context")]
     async fn test_missing_context() {
         async fn runs_without_context() {
-            from_context(|v: Option<&String>| v.cloned().expect("No context found"));
+            from_context(|v: Option<&String>| {
+                v.cloned()
+                    .expect("No context found while using from_context")
+            });
         }
 
         runs_without_context().await;
