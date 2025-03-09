@@ -14,7 +14,8 @@
 //! ## Usage Example
 //!
 //! ```rust,no_run
-//! use with_async_context::{ContextLogger, init_context_logger};
+//! use with_async_context::{ContextLogger, init_context_logger, with_async_context, from_context_mut};
+//! use log::{info, warn};
 //!
 //! #[derive(Clone)]
 //! struct MyContext {
@@ -30,8 +31,24 @@
 //! // Initialize the logger with default format
 //! init_context_logger!(MyContext);
 //!
-//! // Or with custom format
-//! init_context_logger!(MyContext, "[{level}] Request {context}: {message}");
+//! // Or initialize with custom format
+//! // init_context_logger!(MyContext, "[{level}] Request {context}: {message}");
+//!
+//! async fn handle_request() {
+//!     info!("Starting request processing");
+//!     // Do some work
+//!     warn!("Something unexpected happened");
+//! }
+//!
+//! # async fn example() {
+//! // Run function with context
+//! let ctx = MyContext { request_id: "req-123".to_string() };
+//! let (_, _) = with_async_context(ctx, handle_request()).await;
+//!
+//! // Run another request with different context
+//! let ctx2 = MyContext { request_id: "req-456".to_string() };
+//! let (_, _) = with_async_context(ctx2, handle_request()).await;
+//! # }
 //! ```
 
 use std::{env, io::Write};
@@ -134,13 +151,18 @@ where
 /// # Examples
 ///
 /// ```rust,no_run
-/// use with_async_context::{ContextLogger, init_context_logger};
+/// use with_async_context::{ContextLogger, init_context_logger, with_async_context, from_context_mut};
+/// use log::{info, warn};
 ///
 /// #[derive(Debug)]
-/// struct MyContext;
+/// struct MyContext {
+///     function_name: String,
+///     context_id: String,
+/// }
+///
 /// impl ToString for MyContext {
 ///    fn to_string(&self) -> String {
-///       format!("{:?}", self)
+///       format!("[{}:{}]", self.function_name, self.context_id)
 ///   }
 /// }
 ///
@@ -148,7 +170,40 @@ where
 /// init_context_logger!(MyContext);
 ///
 /// // Initialize with custom format
-/// init_context_logger!(MyContext, "{level} [{context}] {message}");
+/// // init_context_logger!(MyContext, "{level} [{context}] {message}");
+///
+/// async fn example_function() {
+///     from_context_mut(|ctx: Option<&mut MyContext>| {
+///         if let Some(ctx) = ctx {
+///             ctx.function_name = "example_function".to_string();
+///         }
+///     });
+///     info!("Inside example function");
+///     warn!("Something to warn about");
+/// }
+///
+/// async fn another_function() {
+///     from_context_mut(|ctx: Option<&mut MyContext>| {
+///         if let Some(ctx) = ctx {
+///             ctx.function_name = "another_function".to_string();
+///         }
+///     });
+///     info!("Inside another function");
+/// }
+///
+/// # async fn run_example() {
+/// let ctx = MyContext {
+///     function_name: String::new(),
+///     context_id: "ctx1".to_string()
+/// };
+/// let (_, _) = with_async_context(ctx, example_function()).await;
+///
+/// let ctx2 = MyContext {
+///     function_name: String::new(),
+///     context_id: "ctx2".to_string()
+/// };
+/// let (_, _) = with_async_context(ctx2, another_function()).await;
+/// # }
 /// ```
 #[macro_export]
 macro_rules! init_context_logger {

@@ -1,10 +1,10 @@
 [package]
 name = "with-async-context"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A Rust library for managing contextual data across async tasks"
 license = "MIT"
-repository = "https://github.com/username/with-async-context"
+repository = "https://github.com/wonop-io/with-async-context"
 documentation = "https://docs.rs/with-async-context"
 readme = "README.md"
 keywords = ["async", "context", "middleware", "web"]
