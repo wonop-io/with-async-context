@@ -1,16 +1,23 @@
 # With Async Context
 
-A Rust library for managing contextual data across async tasks. Enables easily passing request context through middleware and async functions.
+A Rust library providing thread-safe, type-safe context management across asynchronous tasks. It allows passing contextual data through middleware and async functions while maintaining proper lifetimes and preventing common pitfalls.
 
-## Features
+## Problem Solved
 
-- Thread-safe context management using thread-local storage
-- Prevention of nested contexts to avoid confusion and bugs
-- Both immutable and mutable access to context data
-- Type-safe context access through generics
-- Automatic cleanup when async scope exits
-- Integrates with logging frameworks
-- Context propagation across async boundaries
+This library provides a way to pass context data through async Rust code without having to manually thread it through every function call. In server applications, you often need to track data like:
+
+- Request IDs
+- User authentication details
+- IP addresses
+- Request timing metrics
+- Feature flags
+- Account or tenant IDs
+
+Passing this data as function parameters can make code messy and hard to maintain as applications grow. This library provides a simpler approach - it lets you wrap async operations in a context that makes the data available wherever needed in that request or task.
+
+The context is accessed through helper functions, avoiding the need to pass parameters through multiple layers of code. It works well with logging to help track what's happening in your application.
+
+You can use it for web APIs, background jobs, or any async Rust code where you need to maintain contextual data while keeping the benefits of Rust's type system and async support.
 
 ## Installation
 
@@ -18,22 +25,22 @@ Add the following to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-with-async-context = "0.1"
+with-async-context = "0.1.2"
 ```
 
-## Basic Usage
+## Core Concepts
 
-The library provides several key functions for working with async contexts:
+The library is built around a few key functions:
 
-- `execute_with_async_context`: Creates a new context and executes a future within it
-- `from_context`: Access the current context immutably
-- `from_context_mut`: Access the current context mutably
-- `context_as_string`: Get the current context as a string representation
+- `with_async_context`: Establishes a new context scope and runs a future within it
+- `from_context`: Retrieves an immutable reference to the current context
+- `from_context_mut`: Gets a mutable reference to modify the context
+- `context_as_string`: Converts the context to a string representation
 
-Here's a simple example:
+Here's a basic example showing the main patterns:
 
 ```rust
-use with_async_context::{execute_with_async_context, from_context};
+use with_async_context::{with_async_context, from_context};
 
 #[derive(Clone)]
 struct MyContext {
@@ -57,17 +64,17 @@ async fn main() {
         value: "test".to_string()
     };
 
-    let (result, _ctx) = execute_with_async_context(context, my_function()).await;
+    let (result, _ctx) = with_async_context(context, my_function()).await;
     assert_eq!(result, "test");
 }
 ```
 
-## Example with Axum
+## Web Framework Integration
 
-The library integrates well with web frameworks like Axum for request context management:
+The library seamlessly integrates with web frameworks like Axum for request context handling:
 
 ```rust
-use with_async_context::{execute_with_async_context, from_context};
+use with_async_context::{with_async_context, from_context};
 
 #[derive(Clone)]
 pub struct RequestContext {
@@ -95,7 +102,7 @@ async fn axum_request_context(req: Request, next: Next) -> Response {
         path: path.to_owned(),
     };
 
-    let response = execute_with_async_context(context, async move {
+    let response = with_async_context(context, async move {
         let response = next.run(req).await;
         response
     })
@@ -109,7 +116,7 @@ async fn axum_request_context(req: Request, next: Next) -> Response {
 app.layer(axum::middleware::from_fn(axum_request_context))
 ```
 
-The context can then be accessed from any async function within the request:
+Access the context from any async handler:
 
 ```rust
 async fn handler() {
@@ -120,9 +127,9 @@ async fn handler() {
 }
 ```
 
-## Logging Integration
+## Structured Logging
 
-The library includes a logging implementation that automatically includes context information:
+The library includes a logging implementation that automatically incorporates context:
 
 ```rust
 use with_async_context::{ContextLogger, init_context_logger};
@@ -130,36 +137,44 @@ use with_async_context::{ContextLogger, init_context_logger};
 // Initialize with default format
 init_context_logger!(RequestContext);
 
-// Or with custom format
-init_context_logger!(RequestContext, "[{level}] Request {context}: {message}");
+// Or customize the format
+init_context_logger!(RequestContext, "[{level}] {context} | {message}");
 
-// Logs will include context info
-log::info!("Processing request"); // Outputs: "INFO - request_id=123,method=GET,path=/users - Processing request"
+// Logs automatically include context details
+log::info!("Processing request");
+// Outputs: "INFO - request_id=123,method=GET,path=/users - Processing request"
 ```
 
-## Error Handling
+## Safe Error Handling
 
-The library provides safe error handling through Options and Results:
+The library encourages robust error handling patterns:
 
 ```rust
-// Safe unwrapping with default
+// Safely handle missing context with defaults
 let value = from_context(|ctx: Option<&MyContext>| {
-    ctx.map(|c| c.value.clone()).unwrap_or_default()
+    ctx.map(|c| c.value.clone())
+       .unwrap_or_default()
 });
 
-// Pattern matching
+// Use Result for explicit error handling
 let result = from_context(|ctx: Option<&MyContext>| {
     match ctx {
         Some(c) => Ok(c.value.clone()),
-        None => Err("No context found")
+        None => Err("Context not found in current scope")
     }
 });
 ```
 
-## Thread Safety
+## Thread Safety and Async
 
-All context operations are thread-safe and can be used across async tasks and thread pools. The library prevents nested contexts to avoid confusion and potential bugs.
+All operations are thread-safe and can be used reliably across:
+- Async tasks and futures
+- Thread pools
+- Web request handlers
+- Background jobs
+
+The library prevents nested context creation to maintain clear ownership semantics and avoid common pitfalls in async code.
 
 ## License
 
-MIT Licensed.
+Licensed under MIT.

@@ -28,6 +28,6 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Testing rush
+      - name: Testing
         working-directory: with-async-context
         run: cargo test

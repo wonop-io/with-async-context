@@ -19,7 +19,7 @@
 //! ## Usage Example
 //!
 //! ```rust,no_run
-//! use with_async_context::{execute_with_async_context, from_context};
+//! use with_async_context::{with_async_context, from_context, from_context_mut};
 //!
 //! #[derive(Clone)]
 //! struct MyContext {
@@ -39,11 +39,16 @@
 //!     });
 //!
 //!     // Do something with the value...
+//!     from_context_mut(|ctx: Option<&mut MyContext>| {
+//!         if let Some(ctx) = ctx {
+//!             ctx.some_value = "updated value".to_string();
+//!         }
+//!     });
 //! }
 //!
 //! # async fn example() {
 //! let context = MyContext { some_value: "test".to_string() };
-//! let result = execute_with_async_context(context, my_function()).await;
+//! let result = with_async_context(context, my_function()).await;
 //! # }
 //! ```
 use core::future::Future;
@@ -65,7 +70,7 @@ where
     F: Future<Output = T>,
 {
     /// The context data wrapped in a mutex for thread-safety
-    ctx: Mutex<Rc<RefCell<Option<C>>>>,
+    ctx: Mutex<Option<C>>,
 
     /// The future being executed, marked with #[pin] for self-referential struct support
     #[pin]
@@ -86,7 +91,7 @@ where
 /// # Examples
 ///
 /// ```rust,no_run
-/// use with_async_context::execute_with_async_context;
+/// use with_async_context::with_async_context;
 ///
 /// struct MyContext;
 ///
@@ -105,13 +110,13 @@ where
 /// async fn async_function() {}
 ///
 /// # async fn example() {
-/// let result = execute_with_async_context(
+/// let result = with_async_context(
 ///     MyContext::new(),
 ///     async_function()
 /// ).await;
 /// # }
 /// ```
-pub fn execute_with_async_context<C, T, F>(ctx: C, future: F) -> AsyncContext<C, T, F>
+pub fn with_async_context<C, T, F>(ctx: C, future: F) -> AsyncContext<C, T, F>
 where
     C: 'static + ToString,
     F: Future<Output = T>,
@@ -122,7 +127,7 @@ where
     }
 
     AsyncContext {
-        ctx: Mutex::new(Rc::new(RefCell::new(Some(ctx)))),
+        ctx: Mutex::new(Some(ctx)),
         future,
     }
 }
@@ -139,46 +144,48 @@ where
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> core::task::Poll<Self::Output> {
-        let (value, ctx) = {
-            // Take ownership of the context from the mutex, removing it temporarily
-            let ctx: Option<C> = self
-                .ctx
-                .lock()
-                .expect("Failed to lock context mutex")
-                .take();
-            let ctx = Rc::new(RefCell::new(ctx));
+        // Take ownership of the context from the mutex, removing it temporarily
+        let ctx: Option<C> = self
+            .ctx
+            .lock()
+            .expect("Failed to lock context mutex")
+            .take();
+        let ctx = Rc::new(RefCell::new(ctx));
 
-            // Set thread-local flags to indicate context is now active
-            HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
+        // Set thread-local flags to indicate context is now active
+        HAS_CONTEXT.with(|x| *x.borrow_mut() = true);
 
-            // Store context in thread local storage
-            CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
+        // Store context in thread local storage
+        CONTEXT.with(|x| *x.borrow_mut() = Some(ctx.clone()));
 
-            // Project the pinned future to get mutable access
-            let projection = self.project();
-            let future: Pin<&mut F> = projection.future;
+        // Project the pinned future to get mutable access
+        let projection = self.project();
+        let future: Pin<&mut F> = projection.future;
 
-            // Poll the inner future
-            let poll = future.poll(cx);
+        // Poll the inner future
+        let poll = future.poll(cx);
 
-            // Reset thread-local flag since we're done with this poll
-            HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
-            CONTEXT.with(|x| *x.borrow_mut() = None);
-            match poll {
-                // If future is complete, return result with context
-                Poll::Ready(value) => (value, ctx),
-                // If pending, restore context to mutex and return pending
-                Poll::Pending => {
-                    projection
-                        .ctx
-                        .lock()
-                        .expect("Failed to lock context mutex")
-                        .replace(ctx.take());
-                    return Poll::Pending;
-                }
+        let ctx = ctx.take().expect(
+            "No context is attached to the AyncContext - this is not supposed to be possible.",
+        );
+
+        // Reset thread-local flag since we're done with this poll
+        HAS_CONTEXT.with(|x| *x.borrow_mut() = false);
+        CONTEXT.with(|x| *x.borrow_mut() = None);
+
+        match poll {
+            // If future is complete, return result with context
+            Poll::Ready(value) => return Poll::Ready((value, ctx)),
+            // If pending, restore context to mutex and return pending
+            Poll::Pending => {
+                projection
+                    .ctx
+                    .lock()
+                    .expect("Failed to lock context mutex")
+                    .replace(ctx);
+                return Poll::Pending;
             }
-        };
-        return Poll::Ready((value, ctx.take().expect("Context not found")));
+        }
     }
 }
 
@@ -302,7 +309,7 @@ mod tests {
             value
         }
 
-        let async_context = execute_with_async_context("foobar".to_string(), runs_with_context());
+        let async_context = with_async_context("foobar".to_string(), runs_with_context());
         let (value, ctx) = async_context.await;
 
         assert_eq!("foobar", value);
@@ -328,8 +335,7 @@ mod tests {
             })
         }
 
-        let async_context =
-            execute_with_async_context(IntWrapper(RefCell::new(10)), mutate_context());
+        let async_context = with_async_context(IntWrapper(RefCell::new(10)), mutate_context());
         let (value, ctx) = async_context.await;
 
         assert_eq!(15, value);
@@ -359,7 +365,7 @@ mod tests {
             count: 42,
         };
 
-        let async_context = execute_with_async_context(test_struct.clone(), use_complex_context());
+        let async_context = with_async_context(test_struct.clone(), use_complex_context());
         let (value, ctx) = async_context.await;
 
         assert_eq!(test_struct, value);
@@ -382,18 +388,20 @@ mod tests {
         }
 
         let arc_value = Arc::new(100);
-        let async_context =
-            execute_with_async_context(ArcWrapper(arc_value.clone()), use_arc_context());
+        let async_context = with_async_context(ArcWrapper(arc_value.clone()), use_arc_context());
         let (value, _) = async_context.await;
 
         assert_eq!(100, value);
     }
 
     #[tokio::test]
-    #[should_panic(expected = "No context found")]
+    #[should_panic(expected = "No context found while using from_context")]
     async fn test_missing_context() {
         async fn runs_without_context() {
-            from_context(|v: Option<&String>| v.cloned().expect("No context found"));
+            from_context(|v: Option<&String>| {
+                v.cloned()
+                    .expect("No context found while using from_context")
+            });
         }
 
         runs_without_context().await;
@@ -410,11 +418,11 @@ mod tests {
 
         async fn outer_fn() -> String {
             let outer_val = from_context(|ctx: Option<&String>| ctx.unwrap().clone());
-            let inner_context = execute_with_async_context("inner".to_string(), inner_fn()).await;
+            let inner_context = with_async_context("inner".to_string(), inner_fn()).await;
             format!("{}-{}", outer_val, inner_context.0)
         }
 
-        let context = execute_with_async_context("outer".to_string(), outer_fn());
+        let context = with_async_context("outer".to_string(), outer_fn());
         let _ = context.await;
     }
 
@@ -428,7 +436,7 @@ mod tests {
             val
         }
 
-        let context = execute_with_async_context("test".to_string(), task_with_delay());
+        let context = with_async_context("test".to_string(), task_with_delay());
         let (result, _) = context.await;
         assert_eq!("test", result);
     }
@@ -450,9 +458,9 @@ mod tests {
             val + id
         }
 
-        let task1 = execute_with_async_context(IntWrapper(Arc::new(1)), task(10));
-        let task2 = execute_with_async_context(IntWrapper(Arc::new(2)), task(20));
-        let task3 = execute_with_async_context(IntWrapper(Arc::new(3)), task(30));
+        let task1 = with_async_context(IntWrapper(Arc::new(1)), task(10));
+        let task2 = with_async_context(IntWrapper(Arc::new(2)), task(20));
+        let task3 = with_async_context(IntWrapper(Arc::new(3)), task(30));
 
         let ((r1, _), (r2, _), (r3, _)) = tokio::join!(task1, task2, task3);
 
@@ -486,7 +494,7 @@ mod tests {
         }
 
         let context = SimpleContext { value: 42 };
-        let (result, _) = execute_with_async_context(context, nested_task(3)).await;
+        let (result, _) = with_async_context(context, nested_task(3)).await;
 
         // Each level adds 1, so result should be 42 + 3
         assert_eq!(result, 45);
@@ -529,7 +537,7 @@ mod tests {
             // Run in local task to avoid Send requirement
             let result = tokio::task::LocalSet::new()
                 .run_until(async move {
-                    let (result, _) = execute_with_async_context(ctx, check_value(10, n)).await;
+                    let (result, _) = with_async_context(ctx, check_value(10, n)).await;
                     result
                 })
                 .await;
@@ -578,7 +586,7 @@ mod tests {
         }
 
         let ctx = Context1 { value: 42 };
-        let context = execute_with_async_context(ctx, access_wrong_type());
+        let context = with_async_context(ctx, access_wrong_type());
         let _ = context.await;
     }
 }
